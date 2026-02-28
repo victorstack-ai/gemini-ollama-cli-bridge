@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from .analysis import build_prompt, collect_files, gemini_refine, ollama_generate
+from .analysis import AnalysisCache, build_prompt, collect_files, gemini_refine, ollama_generate
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,21 +55,29 @@ def _parse_args() -> argparse.Namespace:
         default=400_000,
         help="Stop after this many bytes of files",
     )
+
+    # Gemini options (SDK-based)
     analyze.add_argument(
         "--gemini-refine",
         action="store_true",
-        help="Run Gemini CLI to refine the offline analysis",
+        help="Run Gemini to refine the offline analysis",
     )
     analyze.add_argument(
-        "--gemini-command",
-        default=os.getenv("GEMINI_CMD", "gemini"),
-        help="Command to invoke Gemini CLI",
+        "--gemini-model",
+        default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        help="Gemini model name (requires GEMINI_API_KEY)",
     )
     analyze.add_argument(
-        "--gemini-args",
-        action="append",
-        default=[],
-        help="Extra args for Gemini CLI (repeatable)",
+        "--gemini-api-key",
+        default=os.getenv("GEMINI_API_KEY", ""),
+        help="Gemini API key (or set GEMINI_API_KEY env var)",
+    )
+
+    # Caching
+    analyze.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable result caching for Ollama analysis",
     )
 
     return parser.parse_args()
@@ -95,13 +103,15 @@ def run() -> int:
             raise SystemExit("No files matched. Adjust --include/--exclude.")
 
         prompt = build_prompt(files, args.focus or None)
-        analysis = ollama_generate(prompt, args.model, args.ollama_url)
+
+        cache = None if args.no_cache else AnalysisCache()
+        analysis = ollama_generate(prompt, args.model, args.ollama_url, cache=cache)
 
         if args.gemini_refine:
             analysis = gemini_refine(
                 analysis=analysis,
-                command=args.gemini_command,
-                args=args.gemini_args,
+                model=args.gemini_model,
+                api_key=args.gemini_api_key or None,
             )
 
         print(analysis)

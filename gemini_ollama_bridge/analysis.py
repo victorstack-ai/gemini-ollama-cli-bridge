@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import shlex
-import shutil
-import subprocess
+import os
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -32,6 +31,18 @@ DEFAULT_INCLUDES = [
     "**/*.yaml",
     "**/*.yml",
 ]
+
+REFINE_SYSTEM_PROMPT = (
+    "You are a senior software engineer. You receive a code analysis report "
+    "produced by a local LLM. Your job is to refine it: remove false positives, "
+    "improve clarity, add actionable suggestions, and re-rank findings by severity. "
+    "Return your refined analysis as Markdown."
+)
+
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,11 @@ def collect_files(
     return collected
 
 
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
+
+
 def build_prompt(files: list[FileChunk], focus: str | None) -> str:
     header = "You are an expert software reviewer. Analyze the following code."
     if focus:
@@ -107,12 +123,57 @@ def build_prompt(files: list[FileChunk], focus: str | None) -> str:
     return "\n".join(blocks)
 
 
+# ---------------------------------------------------------------------------
+# Result caching
+# ---------------------------------------------------------------------------
+
+
+class AnalysisCache:
+    """Simple disk cache keyed by SHA-256 of the prompt string."""
+
+    def __init__(self, cache_dir: Path | None = None) -> None:
+        self._cache_dir = cache_dir or Path(".ollama_cache")
+
+    @staticmethod
+    def _hash(prompt: str) -> str:
+        return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+    def get(self, prompt: str) -> str | None:
+        cache_file = self._cache_dir / (self._hash(prompt) + ".json")
+        if not cache_file.exists():
+            return None
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            return data.get("response")
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def put(self, prompt: str, response: str) -> None:
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = self._cache_dir / (self._hash(prompt) + ".json")
+        cache_file.write_text(
+            json.dumps({"prompt_hash": self._hash(prompt), "response": response}),
+            encoding="utf-8",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ollama
+# ---------------------------------------------------------------------------
+
+
 def ollama_generate(
     prompt: str,
     model: str,
     base_url: str,
     timeout: int = 120,
+    cache: AnalysisCache | None = None,
 ) -> str:
+    if cache is not None:
+        cached = cache.get(prompt)
+        if cached is not None:
+            return cached
+
     url = base_url.rstrip("/") + "/api/generate"
     payload = {"model": model, "prompt": prompt, "stream": False}
     response = requests.post(url, json=payload, timeout=timeout)
@@ -120,40 +181,65 @@ def ollama_generate(
     data = response.json()
     if "response" not in data:
         raise ValueError(f"Unexpected Ollama response: {json.dumps(data)[:200]}")
-    return data["response"]
+
+    result = data["response"]
+
+    if cache is not None:
+        cache.put(prompt, result)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Gemini (google-generativeai SDK)
+# ---------------------------------------------------------------------------
+
+
+class GeminiProvider:
+    """Refine analysis results using the Google Generative AI Python SDK.
+
+    Requires the ``GEMINI_API_KEY`` environment variable (or pass *api_key*
+    explicitly).
+    """
+
+    def __init__(
+        self,
+        model: str = "gemini-2.0-flash",
+        api_key: str | None = None,
+        timeout: int = 120,
+    ) -> None:
+        resolved_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        if not resolved_key:
+            raise ValueError(
+                "GEMINI_API_KEY not set. Export it or pass --gemini-api-key."
+            )
+
+        # Import here so the dependency is optional at module-load time.
+        import google.generativeai as genai  # noqa: WPS433
+
+        genai.configure(api_key=resolved_key)
+        self._model = genai.GenerativeModel(model)
+        self._timeout = timeout
+
+    def refine(self, analysis: str) -> str:
+        """Send *analysis* to Gemini for refinement and return the result."""
+        prompt = f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{analysis}"
+        response = self._model.generate_content(
+            prompt,
+            request_options={"timeout": self._timeout},
+        )
+        text = response.text
+        if not text or not text.strip():
+            raise RuntimeError("Gemini returned empty output")
+        return text.strip()
 
 
 def gemini_refine(
     analysis: str,
-    command: str,
-    args: list[str] | None = None,
+    model: str = "gemini-2.0-flash",
+    api_key: str | None = None,
     timeout: int = 120,
 ) -> str:
-    cmd = shlex.split(command)
-    if not cmd:
-        raise ValueError("Gemini command is empty")
-
-    executable = shutil.which(cmd[0])
-    if not executable:
-        raise FileNotFoundError(f"Gemini command not found: {cmd[0]}")
-
-    final_cmd = [executable, *cmd[1:], *(args or [])]
-    result = subprocess.run(
-        final_cmd,
-        input=analysis,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Gemini CLI failed with exit code "
-            f"{result.returncode}: {result.stderr.strip()}"
-        )
-
-    if not result.stdout.strip():
-        raise RuntimeError("Gemini CLI returned empty output")
-
-    return result.stdout.strip()
+    """Convenience wrapper around :class:`GeminiProvider`."""
+    provider = GeminiProvider(model=model, api_key=api_key, timeout=timeout)
+    return provider.refine(analysis)
